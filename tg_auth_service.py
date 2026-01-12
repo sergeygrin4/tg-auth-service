@@ -32,7 +32,7 @@ PENDING_TTL_SECONDS = int(os.getenv("PENDING_TTL_SECONDS") or "600")  # 10 ми�
 if not API_ID or not API_HASH:
     logger.warning("TG_API_ID / TG_API_HASH are not configured!")
 
-# phone_norm -> {phone, phone_code_hash, created_at}
+# phone_norm -> {session, phone_code_hash, created_at}
 _pending: dict[str, dict] = {}
 
 # ======================= ВСПОМОГАТЕЛЬНЫЕ =======================
@@ -84,8 +84,8 @@ def _cleanup_pending():
 
 async def _send_code_async(phone_norm: str) -> str:
     """
-    Асинхронно отправляем код. ВАЖНО: не вызываем client.start(),
-    только connect() / disconnect(), чтобы Telethon не просил input().
+    Асинхронно отправляем код.
+    ВАЖНО: создаём клиент, отправляем код, сохраняем session и hash в _pending.
     """
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
@@ -93,8 +93,9 @@ async def _send_code_async(phone_norm: str) -> str:
         logger.info("send_code_request for %s", phone_norm)
         res = await client.send_code_request(phone_norm)
         phone_code_hash = res.phone_code_hash
+        session_str = client.session.save()
         _pending[phone_norm] = {
-            "phone": phone_norm,
+            "session": session_str,
             "phone_code_hash": phone_code_hash,
             "created_at": datetime.now(timezone.utc).replace(tzinfo=timezone.utc).isoformat(),
         }
@@ -111,8 +112,8 @@ async def _send_code_async(phone_norm: str) -> str:
 
 async def _confirm_code_async(phone_norm: str, code: str, password: str | None):
     """
-    Асинхронно подтверждаем код и выдаём StringSession.
-    Тоже без client.start(), только connect() / disconnect().
+    Асинхронно подтверждаем код и выдаём финальную StringSession.
+    Используем тот же session, который был при send_code_request.
     """
     _cleanup_pending()
     data = _pending.get(phone_norm)
@@ -120,10 +121,11 @@ async def _confirm_code_async(phone_norm: str, code: str, password: str | None):
         raise ValueError("no_pending_code")
 
     phone_code_hash = data.get("phone_code_hash")
-    if not phone_code_hash:
+    session_str = data.get("session")
+    if not phone_code_hash or not session_str:
         raise ValueError("no_phone_code_hash")
 
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
     await client.connect()
     try:
         logger.info("sign_in for %s with code", phone_norm)
@@ -141,13 +143,13 @@ async def _confirm_code_async(phone_norm: str, code: str, password: str | None):
             await client.sign_in(password=password)
 
         me = await client.get_me()
-        session_str = client.session.save()
+        final_session = client.session.save()
         logger.info("sign_in OK for %s, username=%s", phone_norm, getattr(me, "username", None))
     finally:
         await client.disconnect()
 
     _pending.pop(phone_norm, None)
-    return session_str, me
+    return final_session, me
 
 
 # ======================= ROUTES =======================
@@ -227,8 +229,10 @@ def auth_confirm():
     except SessionPasswordNeededError:
         return jsonify({"error": "2fa_password_required"}), 400
     except PhoneCodeInvalidError:
+        logger.warning("PhoneCodeInvalidError for %s (wrong code)", phone_norm)
         return jsonify({"error": "code_invalid"}), 400
     except PhoneCodeExpiredError:
+        logger.warning("PhoneCodeExpiredError for %s (expired code)", phone_norm)
         return jsonify({"error": "code_expired"}), 400
     except ValueError as e:
         if str(e) in ("no_pending_code", "no_phone_code_hash"):
