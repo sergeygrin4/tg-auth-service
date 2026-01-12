@@ -20,18 +20,14 @@ app = Flask("tg_auth_service")
 
 # ======================= ENV =======================
 
-# API креды Telegram
 API_ID = int(os.getenv("TG_API_ID") or os.getenv("API_ID") or "0")
 API_HASH = os.getenv("TG_API_HASH") or os.getenv("API_HASH") or ""
 
-# Токен, которым миниапп авторизуется при запросах
 AUTH_TOKEN = os.getenv("AUTH_TOKEN") or os.getenv("TG_AUTH_SERVICE_TOKEN") or ""
 
-# Порт
 PORT = int(os.getenv("PORT") or "8080")
 
-# TTL ожидающего кода (10 минут по умолчанию)
-PENDING_TTL_SECONDS = int(os.getenv("PENDING_TTL_SECONDS") or "600")
+PENDING_TTL_SECONDS = int(os.getenv("PENDING_TTL_SECONDS") or "600")  # 10 минут
 
 if not API_ID or not API_HASH:
     logger.warning("TG_API_ID / TG_API_HASH are not configured!")
@@ -43,12 +39,10 @@ _pending: dict[str, dict] = {}
 
 
 def _norm_phone(phone: str) -> str:
-    """Приводим телефон к виду +7..., +48..., +7999..."""
     phone = (phone or "").strip()
     if not phone:
         return ""
     if not phone.startswith("+"):
-        # примитивный нормалайзер: если начинается с 8, меняем на +7
         if phone.startswith("8"):
             phone = "+7" + phone[1:]
         elif phone[0].isdigit():
@@ -57,7 +51,6 @@ def _norm_phone(phone: str) -> str:
 
 
 def _check_auth(req: request) -> bool:
-    """Проверяем, что пришёл правильный Bearer-токен."""
     if not AUTH_TOKEN:
         logger.warning("AUTH_TOKEN is not configured, denying all")
         return False
@@ -69,7 +62,6 @@ def _check_auth(req: request) -> bool:
 
 
 def _cleanup_pending():
-    """Удаляем устаревшие записи ожидающих кодов."""
     if not _pending:
         return
     now = datetime.now(timezone.utc)
@@ -91,9 +83,13 @@ def _cleanup_pending():
 
 
 async def _send_code_async(phone_norm: str) -> str:
-    """Асинхронный Telethon: отправка кода по номеру."""
+    """
+    Асинхронно отправляем код. ВАЖНО: не вызываем client.start(),
+    только connect() / disconnect(), чтобы Telethon не просил input().
+    """
     client = TelegramClient(StringSession(), API_ID, API_HASH)
-    async with client:
+    await client.connect()
+    try:
         logger.info("send_code_request for %s", phone_norm)
         res = await client.send_code_request(phone_norm)
         phone_code_hash = res.phone_code_hash
@@ -109,10 +105,15 @@ async def _send_code_async(phone_norm: str) -> str:
             res,
         )
         return phone_code_hash
+    finally:
+        await client.disconnect()
 
 
 async def _confirm_code_async(phone_norm: str, code: str, password: str | None):
-    """Асинхронный Telethon: подтверждение кода и получение StringSession."""
+    """
+    Асинхронно подтверждаем код и выдаём StringSession.
+    Тоже без client.start(), только connect() / disconnect().
+    """
     _cleanup_pending()
     data = _pending.get(phone_norm)
     if not data:
@@ -123,7 +124,8 @@ async def _confirm_code_async(phone_norm: str, code: str, password: str | None):
         raise ValueError("no_phone_code_hash")
 
     client = TelegramClient(StringSession(), API_ID, API_HASH)
-    async with client:
+    await client.connect()
+    try:
         logger.info("sign_in for %s with code", phone_norm)
         try:
             await client.sign_in(
@@ -141,6 +143,8 @@ async def _confirm_code_async(phone_norm: str, code: str, password: str | None):
         me = await client.get_me()
         session_str = client.session.save()
         logger.info("sign_in OK for %s, username=%s", phone_norm, getattr(me, "username", None))
+    finally:
+        await client.disconnect()
 
     _pending.pop(phone_norm, None)
     return session_str, me
@@ -171,14 +175,12 @@ def auth_start():
         return jsonify({"error": "api_not_configured"}), 500
 
     try:
-        # Важно: никакого input(), только Telegram API
         phone_code_hash = asyncio.run(_send_code_async(phone_norm))
         return jsonify({"ok": True, "phone_code_hash": phone_code_hash}), 200
     except PhoneNumberBannedError:
         logger.exception("PhoneNumberBannedError for %s", phone_norm)
         return jsonify({"error": "phone_banned"}), 400
     except EOFError as e:
-        # На всякий случай ловим, если где-то внутри библиотеки попытается читать stdin
         logger.exception("EOFError in auth_start for %s: %s", phone_norm, e)
         return jsonify({"error": "internal_error", "details": "eof_in_library"}), 500
     except Exception as e:
