@@ -54,12 +54,29 @@ def _check_auth(req: request) -> bool:
     if not AUTH_TOKEN:
         logger.warning("AUTH_TOKEN is not configured, denying all")
         return False
+    # Support both Authorization: Bearer and X-API-KEY for compatibility.
     hdr = req.headers.get("Authorization") or ""
-    if not hdr.startswith("Bearer "):
-        return False
-    token = hdr[len("Bearer ") :].strip()
-    return token == AUTH_TOKEN
+    if hdr.startswith("Bearer "):
+        token = hdr[len("Bearer ") :].strip()
+        return token == AUTH_TOKEN
+    xkey = (req.headers.get("X-API-KEY") or "").strip()
+    return bool(xkey) and xkey == AUTH_TOKEN
 
+
+def _run(coro):
+    """Run an async coroutine from Flask handler safely.
+
+    Some runtimes may already have an event loop in the current thread.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 def _cleanup_pending():
     if not _pending:
@@ -177,7 +194,7 @@ def auth_start():
         return jsonify({"error": "api_not_configured"}), 500
 
     try:
-        phone_code_hash = asyncio.run(_send_code_async(phone_norm))
+        phone_code_hash = _run(_send_code_async(phone_norm))
         return jsonify({"ok": True, "phone_code_hash": phone_code_hash}), 200
     except PhoneNumberBannedError:
         logger.exception("PhoneNumberBannedError for %s", phone_norm)
@@ -210,7 +227,7 @@ def auth_confirm():
         return jsonify({"error": "api_not_configured"}), 500
 
     try:
-        session_str, me = asyncio.run(_confirm_code_async(phone_norm, code, password))
+        session_str, me = _run(_confirm_code_async(phone_norm, code, password))
         return (
             jsonify(
                 {
