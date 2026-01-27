@@ -11,6 +11,8 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
     PhoneNumberBannedError,
+    FloodWaitError,
+    PhoneNumberInvalidError,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -28,6 +30,7 @@ AUTH_TOKEN = os.getenv("AUTH_TOKEN") or os.getenv("TG_AUTH_SERVICE_TOKEN") or ""
 PORT = int(os.getenv("PORT") or "8080")
 
 PENDING_TTL_SECONDS = int(os.getenv("PENDING_TTL_SECONDS") or "600")  # 10 минут
+TG_FORCE_SMS_DEFAULT = (os.getenv("TG_FORCE_SMS") or "").strip().lower() in ("1", "true", "yes", "y")
 
 if not API_ID or not API_HASH:
     logger.warning("TG_API_ID / TG_API_HASH are not configured!")
@@ -99,30 +102,46 @@ def _cleanup_pending():
         _pending.pop(phone, None)
 
 
-async def _send_code_async(phone_norm: str) -> str:
+async def _send_code_async(phone_norm: str, force_sms: bool) -> str:
     """
     Асинхронно отправляем код.
-    ВАЖНО: создаём клиент, отправляем код, сохраняем session и hash в _pending.
+
+    ВАЖНО:
+    - Код чаще всего приходит НЕ SMS, а сообщением в официальном приложении Telegram.
+    - `force_sms=True` может помочь, но Telegram не всегда разрешает SMS.
+
+    Создаём клиент, отправляем код, сохраняем session и hash в _pending.
     """
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
     try:
-        logger.info("send_code_request for %s", phone_norm)
-        res = await client.send_code_request(phone_norm)
-        phone_code_hash = res.phone_code_hash
-        session_str = client.session.save()
-        _pending[phone_norm] = {
-            "session": session_str,
-            "phone_code_hash": phone_code_hash,
-            "created_at": datetime.now(timezone.utc).replace(tzinfo=timezone.utc).isoformat(),
-        }
-        logger.info(
-            "send_code_request OK for %s: phone_code_hash=%s, result=%r",
-            phone_norm,
-            phone_code_hash,
-            res,
-        )
-        return phone_code_hash
+        logger.info("send_code_request for %s (force_sms=%s)", phone_norm, force_sms)
+
+        # 1 небольшой retry при FloodWait <= 30s
+        for attempt in range(2):
+            try:
+                res = await client.send_code_request(phone_norm, force_sms=force_sms)
+                phone_code_hash = res.phone_code_hash
+                session_str = client.session.save()
+                _pending[phone_norm] = {
+                    "session": session_str,
+                    "phone_code_hash": phone_code_hash,
+                    "created_at": datetime.now(timezone.utc).replace(tzinfo=timezone.utc).isoformat(),
+                }
+                logger.info(
+                    "send_code_request OK for %s: phone_code_hash=%s",
+                    phone_norm,
+                    phone_code_hash,
+                )
+                return phone_code_hash
+            except FloodWaitError as e:
+                logger.warning("FloodWaitError for %s: wait=%ss (attempt=%s)", phone_norm, e.seconds, attempt + 1)
+                if attempt == 0 and int(getattr(e, "seconds", 0) or 0) <= 30:
+                    await asyncio.sleep(int(e.seconds) + 1)
+                    continue
+                raise
+
+        raise RuntimeError("send_code_request_failed")
     finally:
         await client.disconnect()
 
@@ -194,8 +213,15 @@ def auth_start():
         return jsonify({"error": "api_not_configured"}), 500
 
     try:
-        phone_code_hash = _run(_send_code_async(phone_norm))
+        force_sms = bool(data.get("force_sms")) if "force_sms" in data else TG_FORCE_SMS_DEFAULT
+        phone_code_hash = _run(_send_code_async(phone_norm, force_sms))
         return jsonify({"ok": True, "phone_code_hash": phone_code_hash}), 200
+    except PhoneNumberInvalidError:
+        logger.exception("PhoneNumberInvalidError for %s", phone_norm)
+        return jsonify({"error": "phone_invalid"}), 400
+    except FloodWaitError as e:
+        logger.warning("FloodWait in auth_start for %s: %ss", phone_norm, getattr(e, "seconds", None))
+        return jsonify({"error": "flood_wait", "wait_seconds": int(getattr(e, "seconds", 0) or 0)}), 429
     except PhoneNumberBannedError:
         logger.exception("PhoneNumberBannedError for %s", phone_norm)
         return jsonify({"error": "phone_banned"}), 400
