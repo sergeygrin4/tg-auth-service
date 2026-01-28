@@ -11,8 +11,8 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
     PhoneNumberBannedError,
-    FloodWaitError,
     PhoneNumberInvalidError,
+    FloodWaitError,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +30,9 @@ AUTH_TOKEN = os.getenv("AUTH_TOKEN") or os.getenv("TG_AUTH_SERVICE_TOKEN") or ""
 PORT = int(os.getenv("PORT") or "8080")
 
 PENDING_TTL_SECONDS = int(os.getenv("PENDING_TTL_SECONDS") or "600")  # 10 минут
+
+# Telegram не всегда отправляет SMS: чаще код приходит сообщением в Telegram.
+# Но иногда помогает force_sms=True.
 TG_FORCE_SMS_DEFAULT = (os.getenv("TG_FORCE_SMS") or "").strip().lower() in ("1", "true", "yes", "y")
 
 if not API_ID or not API_HASH:
@@ -81,6 +84,7 @@ def _run(coro):
     finally:
         loop.close()
 
+
 def _cleanup_pending():
     if not _pending:
         return
@@ -107,10 +111,8 @@ async def _send_code_async(phone_norm: str, force_sms: bool) -> str:
     Асинхронно отправляем код.
 
     ВАЖНО:
-    - Код чаще всего приходит НЕ SMS, а сообщением в официальном приложении Telegram.
-    - `force_sms=True` может помочь, но Telegram не всегда разрешает SMS.
-
-    Создаём клиент, отправляем код, сохраняем session и hash в _pending.
+    - Код часто приходит НЕ SMS, а сообщением в приложении Telegram.
+    - force_sms может помочь, но Telegram не всегда разрешает SMS.
     """
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
@@ -128,16 +130,13 @@ async def _send_code_async(phone_norm: str, force_sms: bool) -> str:
                     "phone_code_hash": phone_code_hash,
                     "created_at": datetime.now(timezone.utc).replace(tzinfo=timezone.utc).isoformat(),
                 }
-                logger.info(
-                    "send_code_request OK for %s: phone_code_hash=%s",
-                    phone_norm,
-                    phone_code_hash,
-                )
+                logger.info("send_code_request OK for %s: phone_code_hash=%s", phone_norm, phone_code_hash)
                 return phone_code_hash
             except FloodWaitError as e:
-                logger.warning("FloodWaitError for %s: wait=%ss (attempt=%s)", phone_norm, e.seconds, attempt + 1)
-                if attempt == 0 and int(getattr(e, "seconds", 0) or 0) <= 30:
-                    await asyncio.sleep(int(e.seconds) + 1)
+                wait_s = int(getattr(e, "seconds", 0) or 0)
+                logger.warning("FloodWaitError for %s: wait=%ss (attempt=%s)", phone_norm, wait_s, attempt + 1)
+                if attempt == 0 and wait_s <= 30:
+                    await asyncio.sleep(wait_s + 1)
                     continue
                 raise
 
@@ -216,18 +215,24 @@ def auth_start():
         force_sms = bool(data.get("force_sms")) if "force_sms" in data else TG_FORCE_SMS_DEFAULT
         phone_code_hash = _run(_send_code_async(phone_norm, force_sms))
         return jsonify({"ok": True, "phone_code_hash": phone_code_hash}), 200
+
     except PhoneNumberInvalidError:
         logger.exception("PhoneNumberInvalidError for %s", phone_norm)
         return jsonify({"error": "phone_invalid"}), 400
-    except FloodWaitError as e:
-        logger.warning("FloodWait in auth_start for %s: %ss", phone_norm, getattr(e, "seconds", None))
-        return jsonify({"error": "flood_wait", "wait_seconds": int(getattr(e, "seconds", 0) or 0)}), 429
+
     except PhoneNumberBannedError:
         logger.exception("PhoneNumberBannedError for %s", phone_norm)
         return jsonify({"error": "phone_banned"}), 400
+
+    except FloodWaitError as e:
+        wait_s = int(getattr(e, "seconds", 0) or 0)
+        logger.warning("FloodWait in auth_start for %s: %ss", phone_norm, wait_s)
+        return jsonify({"error": "flood_wait", "wait_seconds": wait_s}), 429
+
     except EOFError as e:
         logger.exception("EOFError in auth_start for %s: %s", phone_norm, e)
         return jsonify({"error": "internal_error", "details": "eof_in_library"}), 500
+
     except Exception as e:
         logger.exception("auth_start failed for %s: %s", phone_norm, e)
         return jsonify({"error": "internal_error", "details": str(e)}), 500
